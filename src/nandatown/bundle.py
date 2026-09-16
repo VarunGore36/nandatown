@@ -253,9 +253,9 @@ def verify_bundle_integrity(
     cross-record bindings, unsupported or unrecognised evaluator, replay
     mismatch under the local evaluator, attestation) and, separately, the
     evaluator version difference that left replay unchecked when the
-    bundle names an earlier version shipped for its mode. Any other
-    version can be neither replayed nor recognised, so it is an
-    integrity problem."""
+    bundle names a version shipped for its mode that this Town cannot
+    replay. Any other version can be neither replayed nor recognised, so
+    it is an integrity problem."""
     integrity: list[str] = []
     differs: EvaluatorVersionDiffers | None = None
     for problem in verify_bundle(directory):
