@@ -361,13 +361,33 @@ def cmd_campaign(args: argparse.Namespace) -> int:
     from .campaign import run_campaign
 
     campaign_dir, aggregate = run_campaign(args.name, args.trials, args.out,
-                                           seed_base=args.seed_base)
+                                            seed_base=args.seed_base)
     with open(f"{campaign_dir}/campaign-report.md") as f:
         print(f.read())
     print(f"Campaign bundle: {campaign_dir}")
     failed = aggregate["verdicts"].get("failed", 0) \
         + aggregate["verdicts"].get("error", 0)
     return 0 if failed == 0 else 1
+
+
+def cmd_matrix(args: argparse.Namespace) -> int:
+    from .matrix import run_failure_matrix
+
+    scenarios = args.scenario if args.scenario else None
+    faults = args.fault if args.fault else None
+    matrix_dir, result = run_failure_matrix(
+        scenarios=scenarios,
+        faults=faults,
+        trials=args.trials,
+        seed_base=args.seed_base,
+        out_dir=args.out,
+    )
+    with open(f"{matrix_dir}/matrix-report.md") as f:
+        print(f.read())
+    print(f"Matrix bundle: {matrix_dir}")
+    total_violations = sum(c.violations for c in result.cells.values())
+    total_errors = sum(c.errors for c in result.cells.values())
+    return 0 if total_violations + total_errors == 0 else 1
 
 
 def cmd_pulse(args: argparse.Namespace) -> int:
@@ -1013,6 +1033,22 @@ def main(argv: list[str] | None = None) -> int:
     p_campaign.add_argument("--seed-base", type=int, default=1000)
     p_campaign.add_argument("--out", default="runs")
     p_campaign.set_defaults(func=cmd_campaign)
+
+    p_matrix = sub.add_parser(
+        "matrix", help="run the protocol failure matrix: every"
+                       " (scenario x fault) combination, N trials each")
+    p_matrix.add_argument("--scenario", action="append", default=[],
+                          help="scenario to include (default: all matrix"
+                               " scenarios); repeatable")
+    p_matrix.add_argument("--fault", action="append", default=[],
+                          help="fault to include (default: all catalog"
+                               " faults); repeatable")
+    p_matrix.add_argument("--trials", type=int, default=10,
+                          help="trials per cell (default: 10)")
+    p_matrix.add_argument("--seed-base", type=int, default=2000,
+                          help="base seed for determinism (default: 2000)")
+    p_matrix.add_argument("--out", default="runs")
+    p_matrix.set_defaults(func=cmd_matrix)
 
     p_compare = sub.add_parser(
         "compare", help="run the same scenario twice, baseline against"
