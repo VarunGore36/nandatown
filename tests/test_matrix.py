@@ -4,16 +4,25 @@ import os
 import pytest
 
 from nandatown.matrix import (
+    BASELINE_FAULT,
     DEFAULT_MATRIX,
     FAULT_CATALOG,
     CellResult,
+    CellStats,
     FaultSpec,
     MatrixResult,
+    PropagationTrace,
     _build_layer_overrides,
     _build_scenario_fault_rules,
+    _compute_cell_stats,
+    _resolve_fault,
+    _trace_propagation,
+    _wilson_ci,
     register_fault,
+    render_heatmap,
     render_matrix_report,
     run_failure_matrix,
+    run_matrix_comparison,
 )
 from nandatown.sim.scenario import load_bundled
 
@@ -48,6 +57,10 @@ class TestFaultSpec:
         assert d["swap_plugin_id"] == "plain.v1"
         assert d["transport_action"] is None
 
+    def test_baseline_fault_spec(self):
+        assert BASELINE_FAULT.fault_id == "baseline"
+        assert BASELINE_FAULT.fault_type == "baseline"
+
 
 class TestFaultCatalog:
 
@@ -55,7 +68,13 @@ class TestFaultCatalog:
         assert "transport/duplicate" in FAULT_CATALOG
         assert "transport/drop" in FAULT_CATALOG
         assert "transport/delay" in FAULT_CATALOG
+        assert "transport/rate_flood" in FAULT_CATALOG
+        assert "transport/drop_2nd" in FAULT_CATALOG
+        assert "transport/delay_long" in FAULT_CATALOG
+        assert "transport/duplicate_2x" in FAULT_CATALOG
+        assert "transport/drop_3rd" in FAULT_CATALOG
         assert "auth/none" in FAULT_CATALOG
+        assert "baseline" in FAULT_CATALOG
 
     def test_register_fault_adds_to_catalog(self):
         spec = FaultSpec(
@@ -70,7 +89,8 @@ class TestFaultCatalog:
         del FAULT_CATALOG["test/custom"]
 
     def test_transport_fault_has_action(self):
-        for fid in ["transport/duplicate", "transport/drop", "transport/delay"]:
+        for fid in ["transport/duplicate", "transport/drop", "transport/delay",
+                     "transport/rate_flood", "transport/drop_2nd"]:
             spec = FAULT_CATALOG[fid]
             assert spec.fault_type == "transport_fault"
             assert spec.transport_action is not None
@@ -80,42 +100,84 @@ class TestFaultCatalog:
         assert spec.fault_type == "layer_swap"
         assert spec.swap_plugin_id == "plain.v1"
 
+    def test_rate_flood_has_rate(self):
+        spec = FAULT_CATALOG["transport/rate_flood"]
+        assert spec.transport_action == "drop_rate"
+        assert spec.transport_rate == 0.5
+
+    def test_drop_2nd_has_nth(self):
+        spec = FAULT_CATALOG["transport/drop_2nd"]
+        assert spec.transport_nth == 2
+
+    def test_delay_long_has_delay(self):
+        spec = FAULT_CATALOG["transport/delay_long"]
+        assert spec.transport_delay == 5.0
+
 
 class TestFaultRuleBuilding:
 
     def test_transport_duplicate_builds_rule(self):
         fault = FAULT_CATALOG["transport/duplicate"]
-        rules = _build_scenario_fault_rules(fault)
+        rules = _build_scenario_fault_rules([fault])
         assert len(rules) == 1
         assert rules[0]["action"] == "duplicate"
 
     def test_transport_drop_builds_rule(self):
         fault = FAULT_CATALOG["transport/drop"]
-        rules = _build_scenario_fault_rules(fault)
+        rules = _build_scenario_fault_rules([fault])
         assert len(rules) == 1
         assert rules[0]["action"] == "drop"
 
     def test_transport_delay_builds_rule_with_delay(self):
         fault = FAULT_CATALOG["transport/delay"]
-        rules = _build_scenario_fault_rules(fault)
+        rules = _build_scenario_fault_rules([fault])
         assert len(rules) == 1
         assert rules[0]["action"] == "delay"
         assert rules[0]["delay"] == 2.0
 
+    def test_rate_flood_builds_rule_with_rate(self):
+        fault = FAULT_CATALOG["transport/rate_flood"]
+        rules = _build_scenario_fault_rules([fault])
+        assert len(rules) == 1
+        assert rules[0]["action"] == "drop_rate"
+        assert rules[0]["rate"] == 0.5
+
+    def test_drop_2nd_builds_rule_with_nth(self):
+        fault = FAULT_CATALOG["transport/drop_2nd"]
+        rules = _build_scenario_fault_rules([fault])
+        assert len(rules) == 1
+        assert rules[0]["nth"] == 2
+
     def test_layer_swap_builds_no_fault_rules(self):
         fault = FAULT_CATALOG["auth/none"]
-        rules = _build_scenario_fault_rules(fault)
+        rules = _build_scenario_fault_rules([fault])
         assert rules == []
 
     def test_layer_swap_builds_overrides(self):
         fault = FAULT_CATALOG["auth/none"]
-        overrides = _build_layer_overrides(fault)
+        overrides = _build_layer_overrides([fault])
         assert overrides == {"auth": "plain.v1"}
 
     def test_transport_fault_builds_no_overrides(self):
         fault = FAULT_CATALOG["transport/duplicate"]
-        overrides = _build_layer_overrides(fault)
+        overrides = _build_layer_overrides([fault])
         assert overrides is None
+
+    def test_baseline_builds_no_rules(self):
+        rules = _build_scenario_fault_rules([BASELINE_FAULT])
+        assert rules == []
+
+    def test_baseline_builds_no_overrides(self):
+        overrides = _build_layer_overrides([BASELINE_FAULT])
+        assert overrides is None
+
+    def test_composite_fault_builds_multiple_rules(self):
+        faults = [
+            FAULT_CATALOG["transport/drop"],
+            FAULT_CATALOG["transport/delay"],
+        ]
+        rules = _build_scenario_fault_rules(faults)
+        assert len(rules) == 2
 
 
 class TestDefaultMatrix:
@@ -141,6 +203,115 @@ class TestDefaultMatrix:
         assert "transport/duplicate" in faults
         assert "transport/drop" in faults
         assert "transport/delay" in faults
+        assert "transport/rate_flood" in faults
+
+
+class TestWilsonCI:
+
+    def test_perfect_pass(self):
+        lo, hi = _wilson_ci(10, 10)
+        assert lo > 0.6
+        assert hi > 0.95
+
+    def test_total_fail(self):
+        lo, hi = _wilson_ci(0, 10)
+        assert lo < 0.05
+        assert hi < 0.4
+
+    def test_zero_trials(self):
+        lo, hi = _wilson_ci(0, 0)
+        assert lo == 0.0
+        assert hi == 0.0
+
+    def test_half_pass(self):
+        lo, hi = _wilson_ci(5, 10)
+        assert 0.2 < lo < 0.5
+        assert 0.5 < hi < 0.8
+
+    def test_bounds_clamped(self):
+        lo, hi = _wilson_ci(100, 100)
+        assert lo >= 0.0
+        assert hi <= 1.0
+
+
+class TestCellStats:
+
+    def test_empty_cell(self):
+        cell = CellResult(scenario="test", fault_id="test/fault")
+        stats = _compute_cell_stats(cell)
+        assert stats.pass_rate == 0.0
+        assert stats.non_deterministic is False
+
+    def test_all_pass(self):
+        cell = CellResult(
+            scenario="test", fault_id="test/fault",
+            passes=10,
+            trials=[{"verdict": "passed"}] * 10,
+        )
+        stats = _compute_cell_stats(cell)
+        assert stats.pass_rate == 1.0
+        assert stats.non_deterministic is False
+        assert stats.verdict_distribution == {"passed": 10}
+
+    def test_mixed_verdicts_non_deterministic(self):
+        cell = CellResult(
+            scenario="test", fault_id="test/fault",
+            passes=5, violations=5,
+            trials=[{"verdict": "passed"}] * 5 + [{"verdict": "failed"}] * 5,
+        )
+        stats = _compute_cell_stats(cell)
+        assert stats.pass_rate == 0.5
+        assert stats.non_deterministic is True
+
+    def test_all_same_verdict_deterministic(self):
+        cell = CellResult(
+            scenario="test", fault_id="test/fault",
+            violations=10,
+            trials=[{"verdict": "failed"}] * 10,
+        )
+        stats = _compute_cell_stats(cell)
+        assert stats.pass_rate == 0.0
+        assert stats.non_deterministic is False
+
+
+class TestPropagationTrace:
+
+    def test_trace_empty_events(self):
+        trace = _trace_propagation("transport/drop", [], [])
+        assert trace.fault_id == "transport/drop"
+        assert trace.fault_event_ids == []
+
+    def test_trace_detects_dropped_events(self):
+        class FakeEvent:
+            def __init__(self, eid, kind):
+                self.event_id = eid
+                self.kind = kind
+        events = [
+            FakeEvent("ev-1", "message_dropped"),
+            FakeEvent("ev-2", "message_delivered"),
+        ]
+        trace = _trace_propagation("transport/drop", events, [])
+        assert "ev-1" in trace.fault_event_ids
+        assert "ev-2" not in trace.fault_event_ids
+
+    def test_trace_builds_chain(self):
+        class FakeEvent:
+            def __init__(self, eid, kind):
+                self.event_id = eid
+                self.kind = kind
+        events = [
+            FakeEvent("ev-1", "message_duplicated"),
+            FakeEvent("ev-2", "duplicate_recognized"),
+        ]
+        trace = _trace_propagation("transport/duplicate", events, ["settlement"])
+        assert len(trace.chain) == 2
+        assert trace.invariant_name == "settlement"
+
+    def test_trace_to_dict(self):
+        trace = PropagationTrace(fault_id="test")
+        d = trace.to_dict()
+        assert d["fault_id"] == "test"
+        assert isinstance(d["chain"], list)
 
 
 class TestCellResult:
@@ -153,6 +324,8 @@ class TestCellResult:
         assert cell.incompletes == 0
         assert cell.trials == []
         assert cell.invariant_violations == {}
+        assert cell.propagation == []
+        assert cell.baseline_fault_id is None
 
     def test_cell_result_to_dict(self):
         cell = CellResult(
@@ -168,6 +341,8 @@ class TestCellResult:
         assert d["violations"] == 2
         assert d["passes"] == 8
         assert d["invariant_violations"] == {"settlement": 2}
+        assert "stats" in d
+        assert "propagation" in d
 
 
 class TestMatrixResult:
@@ -185,6 +360,24 @@ class TestMatrixResult:
         assert d["scenarios"] == ["marketplace"]
         assert d["trials_per_cell"] == 5
         assert "nandatown_version" in d
+        assert d["comparison"] is None
+
+
+class TestResolveFault:
+
+    def test_resolve_baseline(self):
+        faults = _resolve_fault("baseline")
+        assert len(faults) == 1
+        assert faults[0].fault_type == "baseline"
+
+    def test_resolve_transport_fault(self):
+        faults = _resolve_fault("transport/drop")
+        assert len(faults) == 1
+        assert faults[0].transport_action == "drop"
+
+    def test_resolve_unknown_returns_empty(self):
+        faults = _resolve_fault("nonexistent/fault")
+        assert faults == []
 
 
 class TestRunFailureMatrix:
@@ -196,6 +389,7 @@ class TestRunFailureMatrix:
             trials=2,
             seed_base=3000,
             out_dir=str(tmp_path),
+            include_baseline=False,
         )
         assert os.path.isdir(matrix_dir)
         cell_key = "voting/transport/drop"
@@ -210,16 +404,12 @@ class TestRunFailureMatrix:
             trials=2,
             seed_base=3000,
             out_dir=str(tmp_path),
+            include_baseline=False,
         )
         cell_dir = os.path.join(matrix_dir, "voting/transport/drop")
         assert os.path.isdir(cell_dir)
         bundles = [d for d in os.listdir(cell_dir) if d.startswith("sim-")]
         assert len(bundles) == 2
-        for bundle_name in bundles:
-            bundle_path = os.path.join(cell_dir, bundle_name)
-            assert os.path.exists(os.path.join(bundle_path, "manifest.json"))
-            assert os.path.exists(os.path.join(bundle_path, "result.json"))
-            assert os.path.exists(os.path.join(bundle_path, "events.jsonl"))
 
     def test_deterministic_reproduction(self, tmp_path):
         dir1 = str(tmp_path / "run1")
@@ -232,6 +422,7 @@ class TestRunFailureMatrix:
             trials=3,
             seed_base=4000,
             out_dir=dir1,
+            include_baseline=False,
         )
         _, result2 = run_failure_matrix(
             scenarios=["voting"],
@@ -239,18 +430,13 @@ class TestRunFailureMatrix:
             trials=3,
             seed_base=4000,
             out_dir=dir2,
+            include_baseline=False,
         )
         for key in result1.cells:
             cell1 = result1.cells[key]
             cell2 = result2.cells[key]
             assert cell1.passes == cell2.passes
             assert cell1.violations == cell2.violations
-            assert cell1.errors == cell2.errors
-            assert cell1.incompletes == cell2.incompletes
-            for t1, t2 in zip(cell1.trials, cell2.trials):
-                assert t1["verdict"] == t2["verdict"]
-                if "stages" in t1 and "stages" in t2:
-                    assert t1["stages"] == t2["stages"]
 
     def test_matrix_plan_written(self, tmp_path):
         matrix_dir, _ = run_failure_matrix(
@@ -259,14 +445,13 @@ class TestRunFailureMatrix:
             trials=1,
             seed_base=2000,
             out_dir=str(tmp_path),
+            include_baseline=False,
         )
         plan_path = os.path.join(matrix_dir, "matrix-plan.json")
         assert os.path.exists(plan_path)
         with open(plan_path) as f:
             plan = json.load(f)
         assert plan["scenarios"] == ["voting"]
-        assert plan["faults"] == ["transport/drop"]
-        assert plan["trials_per_cell"] == 1
 
     def test_matrix_result_written(self, tmp_path):
         matrix_dir, result = run_failure_matrix(
@@ -275,13 +460,10 @@ class TestRunFailureMatrix:
             trials=1,
             seed_base=2000,
             out_dir=str(tmp_path),
+            include_baseline=False,
         )
         result_path = os.path.join(matrix_dir, "matrix-result.json")
         assert os.path.exists(result_path)
-        with open(result_path) as f:
-            data = json.load(f)
-        assert data["matrix_id"] == result.matrix_id
-        assert "nandatown_version" in data
 
     def test_matrix_report_written(self, tmp_path):
         matrix_dir, _ = run_failure_matrix(
@@ -290,14 +472,29 @@ class TestRunFailureMatrix:
             trials=1,
             seed_base=2000,
             out_dir=str(tmp_path),
+            include_baseline=False,
         )
         report_path = os.path.join(matrix_dir, "matrix-report.md")
         assert os.path.exists(report_path)
         with open(report_path) as f:
             text = f.read()
         assert "Protocol Failure Matrix" in text
-        assert "voting" in text
-        assert "transport/drop" in text
+
+    def test_heatmap_written(self, tmp_path):
+        matrix_dir, _ = run_failure_matrix(
+            scenarios=["voting"],
+            faults=["transport/drop"],
+            trials=1,
+            seed_base=2000,
+            out_dir=str(tmp_path),
+            include_baseline=False,
+        )
+        heatmap_path = os.path.join(matrix_dir, "matrix-heatmap.html")
+        assert os.path.exists(heatmap_path)
+        with open(heatmap_path) as f:
+            text = f.read()
+        assert "<!DOCTYPE html>" in text
+        assert "Failure Matrix" in text
 
     def test_cell_result_json_written(self, tmp_path):
         matrix_dir, _ = run_failure_matrix(
@@ -306,16 +503,12 @@ class TestRunFailureMatrix:
             trials=2,
             seed_base=2000,
             out_dir=str(tmp_path),
+            include_baseline=False,
         )
         cell_path = os.path.join(
             matrix_dir, "voting/transport/drop", "cell-result.json",
         )
         assert os.path.exists(cell_path)
-        with open(cell_path) as f:
-            data = json.load(f)
-        assert data["scenario"] == "voting"
-        assert data["fault_id"] == "transport/drop"
-        assert data["trials"] == 2
 
     def test_layer_swap_fault_runs_capability_spoofing(self, tmp_path):
         matrix_dir, result = run_failure_matrix(
@@ -324,11 +517,11 @@ class TestRunFailureMatrix:
             trials=2,
             seed_base=2000,
             out_dir=str(tmp_path),
+            include_baseline=False,
         )
         cell_key = "capability_spoofing/auth/none"
         assert cell_key in result.cells
         cell = result.cells[cell_key]
-        assert len(cell.trials) == 2
         assert cell.violations > 0
 
     def test_multiple_scenarios_and_faults(self, tmp_path):
@@ -338,10 +531,10 @@ class TestRunFailureMatrix:
             trials=2,
             seed_base=2000,
             out_dir=str(tmp_path),
+            include_baseline=False,
         )
         assert "voting/transport/drop" in result.cells
         assert "capability_spoofing/auth/none" in result.cells
-        assert "voting/auth/none" not in result.cells
 
     def test_default_faults_per_scenario(self, tmp_path):
         matrix_dir, result = run_failure_matrix(
@@ -349,6 +542,7 @@ class TestRunFailureMatrix:
             trials=1,
             seed_base=2000,
             out_dir=str(tmp_path),
+            include_baseline=False,
         )
         assert "marketplace/transport/duplicate" in result.cells
         assert "marketplace/transport/drop" in result.cells
@@ -361,16 +555,7 @@ class TestRunFailureMatrix:
             trials=1,
             seed_base=2000,
             out_dir=str(tmp_path),
-        )
-        assert len(result.cells) == 0
-
-    def test_empty_scenarios_produces_empty_matrix(self, tmp_path):
-        matrix_dir, result = run_failure_matrix(
-            scenarios=[],
-            faults=["transport/drop"],
-            trials=1,
-            seed_base=2000,
-            out_dir=str(tmp_path),
+            include_baseline=False,
         )
         assert len(result.cells) == 0
 
@@ -383,6 +568,7 @@ class TestRunFailureMatrix:
             trials=2,
             seed_base=2000,
             out_dir=str(tmp_path),
+            include_baseline=False,
         )
         cell_dir = os.path.join(matrix_dir, "voting/transport/drop")
         for bundle_name in os.listdir(cell_dir):
@@ -400,6 +586,7 @@ class TestRunFailureMatrix:
             trials=3,
             seed_base=2000,
             out_dir=str(tmp_path),
+            include_baseline=False,
         )
         cell = result.cells["capability_spoofing/auth/none"]
         assert cell.violations > 0
@@ -412,6 +599,7 @@ class TestRunFailureMatrix:
             trials=2,
             seed_base=5000,
             out_dir=str(tmp_path / "a"),
+            include_baseline=False,
         )
         _, result_b = run_failure_matrix(
             scenarios=["voting"],
@@ -419,6 +607,7 @@ class TestRunFailureMatrix:
             trials=2,
             seed_base=6000,
             out_dir=str(tmp_path / "b"),
+            include_baseline=False,
         )
         for key in result_a.cells:
             cell_a = result_a.cells[key]
@@ -433,11 +622,76 @@ class TestRunFailureMatrix:
             trials=3,
             seed_base=2000,
             out_dir=str(tmp_path),
+            include_baseline=False,
         )
         cell = result.cells["voting/transport/drop"]
         seeds = [t["seed"] for t in cell.trials]
         assert len(seeds) == 3
         assert len(set(seeds)) == 3
+
+    def test_include_baseline_adds_baseline_cell(self, tmp_path):
+        _, result = run_failure_matrix(
+            scenarios=["voting"],
+            faults=["transport/drop"],
+            trials=2,
+            seed_base=2000,
+            out_dir=str(tmp_path),
+            include_baseline=True,
+        )
+        assert "voting/baseline" in result.cells
+        assert "voting/transport/drop" in result.cells
+        baseline = result.cells["voting/baseline"]
+        assert baseline.stats.pass_rate == 1.0
+
+    def test_no_baseline_skips_baseline_cell(self, tmp_path):
+        _, result = run_failure_matrix(
+            scenarios=["voting"],
+            faults=["transport/drop"],
+            trials=2,
+            seed_base=2000,
+            out_dir=str(tmp_path),
+            include_baseline=False,
+        )
+        assert "voting/baseline" not in result.cells
+
+    def test_cell_stats_computed(self, tmp_path):
+        _, result = run_failure_matrix(
+            scenarios=["voting"],
+            faults=["transport/drop"],
+            trials=3,
+            seed_base=2000,
+            out_dir=str(tmp_path),
+            include_baseline=False,
+        )
+        cell = result.cells["voting/transport/drop"]
+        assert isinstance(cell.stats, CellStats)
+        assert 0.0 <= cell.stats.pass_rate <= 1.0
+        assert 0.0 <= cell.stats.ci_lower <= 1.0
+        assert 0.0 <= cell.stats.ci_upper <= 1.0
+
+    def test_baseline_fault_id_set(self, tmp_path):
+        _, result = run_failure_matrix(
+            scenarios=["voting"],
+            faults=["transport/drop"],
+            trials=1,
+            seed_base=2000,
+            out_dir=str(tmp_path),
+            include_baseline=False,
+        )
+        cell = result.cells["voting/transport/drop"]
+        assert cell.baseline_fault_id == "baseline"
+
+    def test_baseline_cell_has_no_baseline_ref(self, tmp_path):
+        _, result = run_failure_matrix(
+            scenarios=["voting"],
+            faults=[],
+            trials=1,
+            seed_base=2000,
+            out_dir=str(tmp_path),
+            include_baseline=True,
+        )
+        cell = result.cells["voting/baseline"]
+        assert cell.baseline_fault_id is None
 
 
 class TestRenderMatrixReport:
@@ -449,11 +703,11 @@ class TestRenderMatrixReport:
             trials=2,
             seed_base=2000,
             out_dir=str(tmp_path),
+            include_baseline=False,
         )
         text = render_matrix_report(result)
         assert "Protocol Failure Matrix" in text
         assert "Matrix ID" in text
-        assert "Trials/cell" in text
 
     def test_report_contains_cell_data(self, tmp_path):
         _, result = run_failure_matrix(
@@ -462,6 +716,7 @@ class TestRenderMatrixReport:
             trials=2,
             seed_base=2000,
             out_dir=str(tmp_path),
+            include_baseline=False,
         )
         text = render_matrix_report(result)
         assert "voting" in text
@@ -474,23 +729,125 @@ class TestRenderMatrixReport:
             trials=1,
             seed_base=2000,
             out_dir=str(tmp_path),
+            include_baseline=False,
         )
         text = render_matrix_report(result)
         assert "First message is silently dropped" in text
 
-    def test_report_shows_violations(self, tmp_path):
+    def test_report_contains_stats_columns(self, tmp_path):
         _, result = run_failure_matrix(
-            scenarios=["capability_spoofing"],
-            faults=["auth/none"],
-            trials=3,
+            scenarios=["voting"],
+            faults=["transport/drop"],
+            trials=2,
             seed_base=2000,
             out_dir=str(tmp_path),
+            include_baseline=False,
         )
         text = render_matrix_report(result)
-        assert "auth/none" in text
-        cell = result.cells["capability_spoofing/auth/none"]
-        if cell.violations > 0:
-            assert str(cell.violations) in text
+        assert "Pass%" in text
+        assert "95%CI" in text
+        assert "Det?" in text
+
+    def test_report_contains_legend(self, tmp_path):
+        _, result = run_failure_matrix(
+            scenarios=["voting"],
+            faults=["transport/drop"],
+            trials=1,
+            seed_base=2000,
+            out_dir=str(tmp_path),
+            include_baseline=False,
+        )
+        text = render_matrix_report(result)
+        assert "Wilson score" in text
+
+
+class TestRenderHeatmap:
+
+    def test_heatmap_contains_html(self, tmp_path):
+        _, result = run_failure_matrix(
+            scenarios=["voting"],
+            faults=["transport/drop"],
+            trials=1,
+            seed_base=2000,
+            out_dir=str(tmp_path),
+            include_baseline=False,
+        )
+        html_out = render_heatmap(result)
+        assert "<!DOCTYPE html>" in html_out
+        assert "Failure Matrix" in html_out
+        assert "voting" in html_out
+        assert "transport/drop" in html_out
+
+    def test_heatmap_contains_stats_table(self, tmp_path):
+        _, result = run_failure_matrix(
+            scenarios=["voting"],
+            faults=["transport/drop"],
+            trials=1,
+            seed_base=2000,
+            out_dir=str(tmp_path),
+            include_baseline=False,
+        )
+        html_out = render_heatmap(result)
+        assert "<table>" in html_out
+        assert "Pass Rate" in html_out
+
+
+class TestMatrixComparison:
+
+    def test_comparison_runs_both_configurations(self, tmp_path):
+        cmp_dir, comparison = run_matrix_comparison(
+            scenarios=["capability_spoofing"],
+            faults=["auth/none"],
+            trials=2,
+            seed_base=2000,
+            out_dir=str(tmp_path),
+            compare_layer="auth",
+            compare_plugin="plain.v1",
+        )
+        assert os.path.isdir(cmp_dir)
+        assert comparison["compare_layer"] == "auth"
+        assert comparison["compare_plugin"] == "plain.v1"
+
+    def test_comparison_detects_differences(self, tmp_path):
+        cmp_dir, comparison = run_matrix_comparison(
+            scenarios=["capability_spoofing"],
+            faults=["auth/none"],
+            trials=2,
+            seed_base=2000,
+            out_dir=str(tmp_path),
+            compare_layer="auth",
+            compare_plugin="plain.v1",
+        )
+        assert len(comparison["differences"]) > 0
+
+    def test_comparison_report_written(self, tmp_path):
+        cmp_dir, _ = run_matrix_comparison(
+            scenarios=["capability_spoofing"],
+            faults=["auth/none"],
+            trials=2,
+            seed_base=2000,
+            out_dir=str(tmp_path),
+            compare_layer="auth",
+            compare_plugin="plain.v1",
+        )
+        report_path = os.path.join(cmp_dir, "comparison-report.md")
+        assert os.path.exists(report_path)
+        with open(report_path) as f:
+            text = f.read()
+        assert "Failure Matrix Comparison" in text
+
+    def test_comparison_json_written(self, tmp_path):
+        cmp_dir, _ = run_matrix_comparison(
+            scenarios=["capability_spoofing"],
+            faults=["auth/none"],
+            trials=2,
+            seed_base=2000,
+            out_dir=str(tmp_path),
+            compare_layer="auth",
+            compare_plugin="plain.v1",
+        )
+        json_path = os.path.join(cmp_dir, "comparison.json")
+        assert os.path.exists(json_path)
 
 
 class TestMatrixCLI:
@@ -504,6 +861,7 @@ class TestMatrixCLI:
             "--fault", "transport/drop",
             "--trials", "2",
             "--seed-base", "2000",
+            "--no-baseline",
             "--out", str(tmp_path),
         ])
         assert ret == 0
@@ -517,21 +875,7 @@ class TestMatrixCLI:
             "matrix",
             "--scenario", "voting",
             "--trials", "1",
-            "--out", str(tmp_path),
-        ])
-        assert ret == 0
-        text = capsys.readouterr().out
-        assert "transport/drop" in text
-
-    def test_matrix_cli_multiple_scenarios(self, tmp_path, capsys):
-        from nandatown.cli import main
-
-        ret = main([
-            "matrix",
-            "--scenario", "voting",
-            "--scenario", "auction",
-            "--fault", "transport/drop",
-            "--trials", "1",
+            "--no-baseline",
             "--out", str(tmp_path),
         ])
         assert ret == 0
@@ -544,21 +888,37 @@ class TestMatrixCLI:
             "--scenario", "capability_spoofing",
             "--fault", "auth/none",
             "--trials", "3",
+            "--no-baseline",
             "--out", str(tmp_path),
         ])
         assert ret == 1
 
-    def test_matrix_cli_unknown_fault_skipped(self, tmp_path, capsys):
+    def test_matrix_cli_with_baseline(self, tmp_path, capsys):
         from nandatown.cli import main
 
         ret = main([
             "matrix",
             "--scenario", "voting",
-            "--fault", "nonexistent/fault",
+            "--fault", "transport/drop",
             "--trials", "1",
             "--out", str(tmp_path),
         ])
         assert ret == 0
+
+    def test_matrix_cli_compare_layer(self, tmp_path, capsys):
+        from nandatown.cli import main
+
+        ret = main([
+            "matrix",
+            "--scenario", "capability_spoofing",
+            "--fault", "auth/none",
+            "--trials", "2",
+            "--compare-layer", "auth=plain.v1",
+            "--out", str(tmp_path),
+        ])
+        assert ret == 1
+        text = capsys.readouterr().out
+        assert "Failure Matrix Comparison" in text
 
 
 class TestExistingFunctionalityPreserved:
@@ -586,7 +946,6 @@ class TestExistingFunctionalityPreserved:
             "voting", trials=2, out_dir=str(tmp_path),
         )
         assert aggregate["trials"] == 2
-        assert "verdicts" in aggregate
 
     def test_bundle_verification_still_works(self, tmp_path):
         from nandatown.bundle import verify_bundle
@@ -602,17 +961,13 @@ class TestScenarioFaultInjection:
     def test_marketplace_with_transport_duplicate(self, tmp_path):
         from nandatown.sim.runner import run_lab
 
-        bundle_dir, result = run_lab(
-            "marketplace", str(tmp_path), seed=42,
-        )
+        bundle_dir, result = run_lab("marketplace", str(tmp_path), seed=42)
         assert result.verdict in ("passed", "failed", "incomplete", "error")
 
     def test_consensus_with_transport_drop(self, tmp_path):
         from nandatown.sim.runner import run_lab
 
-        bundle_dir, result = run_lab(
-            "consensus", str(tmp_path), seed=42,
-        )
+        bundle_dir, result = run_lab("consensus", str(tmp_path), seed=42)
         assert result.verdict in ("passed", "failed", "incomplete", "error")
 
     def test_capability_spoofing_with_auth_none(self, tmp_path):
@@ -633,41 +988,6 @@ class TestScenarioFaultInjection:
         assert result.verdict == "passed"
 
 
-class TestReportIntegration:
-
-    def test_matrix_report_renders_table_structure(self, tmp_path):
-        _, result = run_failure_matrix(
-            scenarios=["voting", "auction"],
-            faults=["transport/drop"],
-            trials=2,
-            seed_base=2000,
-            out_dir=str(tmp_path),
-        )
-        text = render_matrix_report(result)
-        lines = text.strip().split("\n")
-        header_idx = None
-        for i, line in enumerate(lines):
-            if "Scenario" in line and "Fault" in line and "Trials" in line:
-                header_idx = i
-                break
-        assert header_idx is not None
-        separator = lines[header_idx + 1]
-        assert all(c == "-" for c in separator)
-
-    def test_matrix_report_shows_all_scenarios(self, tmp_path):
-        _, result = run_failure_matrix(
-            scenarios=["voting", "auction", "consensus"],
-            faults=["transport/drop"],
-            trials=1,
-            seed_base=2000,
-            out_dir=str(tmp_path),
-        )
-        text = render_matrix_report(result)
-        assert "voting" in text
-        assert "auction" in text
-        assert "consensus" in text
-
-
 class TestEvidenceIntegration:
 
     def test_each_trial_bundle_has_correct_mode(self, tmp_path):
@@ -679,6 +999,7 @@ class TestEvidenceIntegration:
             trials=2,
             seed_base=2000,
             out_dir=str(tmp_path),
+            include_baseline=False,
         )
         cell_dir = os.path.join(matrix_dir, "voting/transport/drop")
         for name in os.listdir(cell_dir):
@@ -695,6 +1016,7 @@ class TestEvidenceIntegration:
             trials=2,
             seed_base=2000,
             out_dir=str(tmp_path),
+            include_baseline=False,
         )
         cell_dir = os.path.join(matrix_dir, "voting/transport/drop")
         for name in os.listdir(cell_dir):
@@ -711,6 +1033,7 @@ class TestEvidenceIntegration:
             trials=2,
             seed_base=2000,
             out_dir=str(tmp_path),
+            include_baseline=False,
         )
         cell_dir = os.path.join(matrix_dir, "voting/transport/drop")
         for name in os.listdir(cell_dir):

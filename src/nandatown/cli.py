@@ -371,16 +371,38 @@ def cmd_campaign(args: argparse.Namespace) -> int:
 
 
 def cmd_matrix(args: argparse.Namespace) -> int:
-    from .matrix import run_failure_matrix
+    from .matrix import run_failure_matrix, run_matrix_comparison
 
     scenarios = args.scenario if args.scenario else None
     faults = args.fault if args.fault else None
+
+    if args.compare_layer:
+        layer, _, plugin = args.compare_layer.partition("=")
+        if not plugin:
+            print(f"--compare-layer {args.compare_layer!r} must look like"
+                  " layer=plugin.id")
+            return 2
+        cmp_dir, comparison = run_matrix_comparison(
+            scenarios=scenarios,
+            faults=faults,
+            trials=args.trials,
+            seed_base=args.seed_base,
+            out_dir=args.out,
+            compare_layer=layer,
+            compare_plugin=plugin,
+        )
+        with open(f"{cmp_dir}/comparison-report.md") as f:
+            print(f.read())
+        print(f"Comparison bundle: {cmp_dir}")
+        return 0 if not comparison["differences"] else 1
+
     matrix_dir, result = run_failure_matrix(
         scenarios=scenarios,
         faults=faults,
         trials=args.trials,
         seed_base=args.seed_base,
         out_dir=args.out,
+        include_baseline=not args.no_baseline,
     )
     with open(f"{matrix_dir}/matrix-report.md") as f:
         print(f.read())
@@ -1047,6 +1069,12 @@ def main(argv: list[str] | None = None) -> int:
                           help="trials per cell (default: 10)")
     p_matrix.add_argument("--seed-base", type=int, default=2000,
                           help="base seed for determinism (default: 2000)")
+    p_matrix.add_argument("--no-baseline", action="store_true",
+                          help="skip the no-fault baseline cell per scenario")
+    p_matrix.add_argument("--compare-layer", default=None,
+                          metavar="LAYER=PLUGIN_ID",
+                          help="run matrix comparison: baseline vs swapped"
+                               " layer (e.g., auth=plain.v1)")
     p_matrix.add_argument("--out", default="runs")
     p_matrix.set_defaults(func=cmd_matrix)
 
