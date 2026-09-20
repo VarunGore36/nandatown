@@ -755,6 +755,408 @@ def render_matrix_report(result: MatrixResult) -> str:
     return "\n".join(lines) + "\n"
 
 
+def load_matrix_result(matrix_dir: str) -> MatrixResult:
+    result_path = os.path.join(matrix_dir, "matrix-result.json")
+    if not os.path.exists(result_path):
+        raise FileNotFoundError(f"no matrix-result.json in {matrix_dir}")
+    with open(result_path) as f:
+        data = json.load(f)
+
+    cells: dict[str, CellResult] = {}
+    for cell_key, cell_data in data.get("cells", {}).items():
+        stats = CellStats(
+            pass_rate=cell_data.get("stats", {}).get("pass_rate", 0.0),
+            ci_lower=cell_data.get("stats", {}).get("ci_lower", 0.0),
+            ci_upper=cell_data.get("stats", {}).get("ci_upper", 0.0),
+            non_deterministic=cell_data.get("stats", {}).get(
+                "non_deterministic", False),
+            verdict_distribution=cell_data.get("stats", {}).get(
+                "verdict_distribution", {}),
+        )
+        cells[cell_key] = CellResult(
+            scenario=cell_data["scenario"],
+            fault_id=cell_data["fault_id"],
+            trials=cell_data.get("trials_list", cell_data.get("trials", [])),
+            violations=cell_data.get("violations", 0),
+            passes=cell_data.get("passes", 0),
+            errors=cell_data.get("errors", 0),
+            incompletes=cell_data.get("incompletes", 0),
+            invariant_violations=cell_data.get("invariant_violations", {}),
+            stats=stats,
+            baseline_fault_id=cell_data.get("baseline_fault_id"),
+        )
+
+    return MatrixResult(
+        matrix_id=data["matrix_id"],
+        scenarios=data["scenarios"],
+        faults=data["faults"],
+        trials_per_cell=data["trials_per_cell"],
+        seed_base=data["seed_base"],
+        cells=cells,
+        started_at=data.get("started_at", 0.0),
+        completed_at=data.get("completed_at", 0.0),
+    )
+
+
+@dataclass
+class DiffEntry:
+    cell_key: str
+    old_pass_rate: float
+    new_pass_rate: float
+    old_violations: int
+    new_violations: int
+    delta_pass_rate: float
+    status: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "cell_key": self.cell_key,
+            "old_pass_rate": round(self.old_pass_rate, 4),
+            "new_pass_rate": round(self.new_pass_rate, 4),
+            "old_violations": self.old_violations,
+            "new_violations": self.new_violations,
+            "delta_pass_rate": round(self.delta_pass_rate, 4),
+            "status": self.status,
+        }
+
+
+@dataclass
+class MatrixDiff:
+    old_matrix_id: str
+    new_matrix_id: str
+    old_dir: str
+    new_dir: str
+    entries: list[DiffEntry] = field(default_factory=list)
+    regressions: int = 0
+    improvements: int = 0
+    unchanged: int = 0
+    new_cells: int = 0
+    removed_cells: int = 0
+    compared_at: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "old_matrix_id": self.old_matrix_id,
+            "new_matrix_id": self.new_matrix_id,
+            "old_dir": self.old_dir,
+            "new_dir": self.new_dir,
+            "entries": [e.to_dict() for e in self.entries],
+            "regressions": self.regressions,
+            "improvements": self.improvements,
+            "unchanged": self.unchanged,
+            "new_cells": self.new_cells,
+            "removed_cells": self.removed_cells,
+            "compared_at": self.compared_at,
+        }
+
+
+def diff_matrices(old_dir: str, new_dir: str) -> tuple[str, MatrixDiff]:
+    old_result = load_matrix_result(old_dir)
+    new_result = load_matrix_result(new_dir)
+
+    diff = MatrixDiff(
+        old_matrix_id=old_result.matrix_id,
+        new_matrix_id=new_result.matrix_id,
+        old_dir=old_dir,
+        new_dir=new_dir,
+        compared_at=time.time(),
+    )
+
+    all_keys = set(old_result.cells.keys()) | set(new_result.cells.keys())
+
+    for key in sorted(all_keys):
+        old_cell = old_result.cells.get(key)
+        new_cell = new_result.cells.get(key)
+
+        if old_cell is None:
+            entry = DiffEntry(
+                cell_key=key,
+                old_pass_rate=0.0,
+                new_pass_rate=new_cell.stats.pass_rate if new_cell else 0.0,
+                old_violations=0,
+                new_violations=new_cell.violations if new_cell else 0,
+                delta_pass_rate=new_cell.stats.pass_rate if new_cell else 0.0,
+                status="new",
+            )
+            diff.new_cells += 1
+        elif new_cell is None:
+            entry = DiffEntry(
+                cell_key=key,
+                old_pass_rate=old_cell.stats.pass_rate,
+                new_pass_rate=0.0,
+                old_violations=old_cell.violations,
+                new_violations=0,
+                delta_pass_rate=-old_cell.stats.pass_rate,
+                status="removed",
+            )
+            diff.removed_cells += 1
+        else:
+            delta = new_cell.stats.pass_rate - old_cell.stats.pass_rate
+            if delta < -0.001:
+                status = "REGRESSION"
+                diff.regressions += 1
+            elif delta > 0.001:
+                status = "improvement"
+                diff.improvements += 1
+            else:
+                status = "unchanged"
+                diff.unchanged += 1
+            entry = DiffEntry(
+                cell_key=key,
+                old_pass_rate=old_cell.stats.pass_rate,
+                new_pass_rate=new_cell.stats.pass_rate,
+                old_violations=old_cell.violations,
+                new_violations=new_cell.violations,
+                delta_pass_rate=delta,
+                status=status,
+            )
+
+        diff.entries.append(entry)
+
+    diff_dir = os.path.join(
+        os.path.dirname(new_dir),
+        f"diff-{old_result.matrix_id[:12]}-{new_result.matrix_id[:12]}",
+    )
+    os.makedirs(diff_dir, exist_ok=True)
+
+    with open(os.path.join(diff_dir, "diff-result.json"), "w") as f:
+        json.dump(diff.to_dict(), f, indent=2)
+    with open(os.path.join(diff_dir, "diff-report.md"), "w") as f:
+        f.write(render_diff_report(diff))
+
+    return diff_dir, diff
+
+
+def render_diff_report(diff: MatrixDiff) -> str:
+    lines: list[str] = []
+    add = lines.append
+    add("NANDA Town Failure Matrix Diff")
+    add("=" * 60)
+    add(f"Old:  {diff.old_matrix_id}  ({diff.old_dir})")
+    add(f"New:  {diff.new_matrix_id}  ({diff.new_dir})")
+    add("")
+    add(f"Regressions:  {diff.regressions}")
+    add(f"Improvements: {diff.improvements}")
+    add(f"Unchanged:    {diff.unchanged}")
+    add(f"New cells:    {diff.new_cells}")
+    add(f"Removed:      {diff.removed_cells}")
+    add("")
+
+    has_change = diff.regressions or diff.improvements or diff.new_cells or diff.removed_cells
+    if not has_change:
+        add("No changes detected between the two matrix runs.")
+        return "\n".join(lines) + "\n"
+
+    header = (
+        f"{'Cell':<40} {'Old Pass%':>10} {'New Pass%':>10} "
+        f"{'Delta':>8} {'Old F':>6} {'New F':>6} {'Status'}"
+    )
+    add(header)
+    add("-" * len(header))
+
+    shown = [e for e in diff.entries if e.status != "unchanged"]
+    if not shown:
+        shown = diff.entries
+
+    for entry in shown:
+        marker = ""
+        if entry.status == "REGRESSION":
+            marker = " <<< REGRESSION"
+        elif entry.status == "improvement":
+            marker = " ^^^ improvement"
+        elif entry.status == "new":
+            marker = " (new)"
+        elif entry.status == "removed":
+            marker = " (removed)"
+        add(
+            f"{entry.cell_key:<40} "
+            f"{entry.old_pass_rate:>10.1%} "
+            f"{entry.new_pass_rate:>10.1%} "
+            f"{entry.delta_pass_rate:>+8.1%} "
+            f"{entry.old_violations:>6} "
+            f"{entry.new_violations:>6} "
+            f"{entry.status}{marker}"
+        )
+
+    add("")
+    add("Regressions (<<<) indicate pass rate decreased between old and new.")
+    add("Improvements (^^^) indicate pass rate increased.")
+    return "\n".join(lines) + "\n"
+
+
+@dataclass
+class VerifyResult:
+    matrix_id: str
+    matrix_dir: str
+    total_cells: int = 0
+    verified_cells: int = 0
+    mismatched_cells: int = 0
+    skipped_cells: int = 0
+    mismatches: list[dict[str, Any]] = field(default_factory=list)
+    verified_at: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "matrix_id": self.matrix_id,
+            "matrix_dir": self.matrix_dir,
+            "total_cells": self.total_cells,
+            "verified_cells": self.verified_cells,
+            "mismatched_cells": self.mismatched_cells,
+            "skipped_cells": self.skipped_cells,
+            "mismatches": self.mismatches,
+            "verified_at": self.verified_at,
+            "reproducible": self.mismatched_cells == 0,
+        }
+
+
+def verify_matrix(matrix_dir: str) -> tuple[str, VerifyResult]:
+    from .sim.runner import run_lab
+
+    result = load_matrix_result(matrix_dir)
+
+    verify = VerifyResult(
+        matrix_id=result.matrix_id,
+        matrix_dir=matrix_dir,
+        verified_at=time.time(),
+    )
+
+    plan_path = os.path.join(matrix_dir, "matrix-plan.json")
+    if not os.path.exists(plan_path):
+        raise FileNotFoundError(f"no matrix-plan.json in {matrix_dir}")
+    with open(plan_path) as f:
+        plan = json.load(f)
+
+    plan_scenarios = plan.get("scenarios", [])
+    plan_faults = plan.get("faults", [])
+    plan_trials = plan.get("trials_per_cell", 0)
+    plan_seed_base = plan.get("seed_base", 0)
+
+    for cell_key, cell in result.cells.items():
+        scenario, fault_id = cell_key.split("/", 1)
+        verify.total_cells += 1
+
+        cell_dir = os.path.join(matrix_dir, cell_key)
+        if not os.path.isdir(cell_dir):
+            verify.skipped_cells += 1
+            continue
+
+        bundle_dirs = sorted(
+            d for d in os.listdir(cell_dir) if d.startswith("sim-")
+        )
+        if len(bundle_dirs) == 0:
+            verify.skipped_cells += 1
+            continue
+
+        recorded_verdicts = []
+        for bundle_name in bundle_dirs:
+            result_path = os.path.join(cell_dir, bundle_name, "result.json")
+            if not os.path.exists(result_path):
+                recorded_verdicts.append("unknown")
+                continue
+            with open(result_path) as f:
+                bundle_result = json.load(f)
+            recorded_verdicts.append(bundle_result.get("verdict", "unknown"))
+
+        if len(recorded_verdicts) != plan_trials:
+            verify.skipped_cells += 1
+            continue
+
+        cell_index = 0
+        found = False
+        for si, s in enumerate(plan_scenarios):
+            for fi, fid in enumerate(plan_faults):
+                if f"{s}/{fid}" == cell_key:
+                    cell_index = si * len(plan_faults) + fi
+                    found = True
+                    break
+            if found:
+                break
+
+        fault_specs = _resolve_fault(fault_id)
+        layer_overrides = None
+        for fs in fault_specs:
+            if fs.fault_type == "layer_swap" and fs.swap_plugin_id:
+                if layer_overrides is None:
+                    layer_overrides = {}
+                layer_overrides[fs.layer] = fs.swap_plugin_id
+
+        replay_dir = os.path.join(cell_dir, "_replay")
+        os.makedirs(replay_dir, exist_ok=True)
+
+        replay_verdicts = []
+        for trial_idx in range(plan_trials):
+            seed = plan_seed_base + cell_index * 1000 + trial_idx
+            try:
+                _, replay_result = run_lab(
+                    scenario,
+                    replay_dir,
+                    seed=seed,
+                    layer_overrides=layer_overrides,
+                )
+                replay_verdicts.append(replay_result.verdict)
+            except Exception:
+                replay_verdicts.append("error")
+
+        match = recorded_verdicts == replay_verdicts
+        if match:
+            verify.verified_cells += 1
+        else:
+            verify.mismatched_cells += 1
+            verify.mismatches.append({
+                "cell_key": cell_key,
+                "recorded_verdicts": recorded_verdicts,
+                "replay_verdicts": replay_verdicts,
+            })
+
+    verify_dir = os.path.join(matrix_dir, "verify")
+    os.makedirs(verify_dir, exist_ok=True)
+
+    with open(os.path.join(verify_dir, "verify-result.json"), "w") as f:
+        json.dump(verify.to_dict(), f, indent=2)
+    with open(os.path.join(verify_dir, "verify-report.md"), "w") as f:
+        f.write(render_verify_report(verify))
+
+    return verify_dir, verify
+
+
+def render_verify_report(verify: VerifyResult) -> str:
+    lines: list[str] = []
+    add = lines.append
+    add("NANDA Town Matrix Reproduction Verification")
+    add("=" * 55)
+    add(f"Matrix:   {verify.matrix_id}")
+    add(f"Source:   {verify.matrix_dir}")
+    add("")
+    add(f"Total cells:      {verify.total_cells}")
+    add(f"Verified:         {verify.verified_cells}")
+    add(f"Mismatched:       {verify.mismatched_cells}")
+    add(f"Skipped:          {verify.skipped_cells}")
+    add("")
+
+    if verify.mismatched_cells == 0 and verify.verified_cells > 0:
+        add("RESULT: REPRODUCIBLE")
+        add("All verified cells produced identical verdicts when replayed"
+            " with the same seeds.")
+    elif verify.mismatched_cells > 0:
+        add("RESULT: NOT REPRODUCIBLE")
+        add("Some cells produced different verdicts on replay.")
+        add("")
+        add("Mismatches:")
+        for m in verify.mismatches:
+            add(f"  {m['cell_key']}:")
+            add(f"    recorded: {m['recorded_verdicts']}")
+            add(f"    replay:   {m['replay_verdicts']}")
+    else:
+        add("RESULT: INCONCLUSIVE")
+        add("No cells could be verified (missing data).")
+
+    add("")
+    add("Verification replays each trial with the same seed and compares"
+        " verdicts.")
+    add("Run IDs and bundle paths differ; only logical verdicts must match.")
+    return "\n".join(lines) + "\n"
+
+
 def render_heatmap(result: MatrixResult) -> str:
     scenarios = result.scenarios
     faults = result.faults

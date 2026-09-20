@@ -412,6 +412,44 @@ def cmd_matrix(args: argparse.Namespace) -> int:
     return 0 if total_violations + total_errors == 0 else 1
 
 
+def cmd_matrix_diff(args: argparse.Namespace) -> int:
+    import os
+
+    from .matrix import diff_matrices
+
+    old_dir = args.old
+    new_dir = args.new
+    if not os.path.isdir(old_dir):
+        print(f"old matrix directory not found: {old_dir}")
+        return 2
+    if not os.path.isdir(new_dir):
+        print(f"new matrix directory not found: {new_dir}")
+        return 2
+
+    diff_dir, diff = diff_matrices(old_dir, new_dir)
+    with open(f"{diff_dir}/diff-report.md") as f:
+        print(f.read())
+    print(f"Diff bundle: {diff_dir}")
+    return 0 if diff.regressions == 0 else 1
+
+
+def cmd_matrix_verify(args: argparse.Namespace) -> int:
+    import os
+
+    from .matrix import verify_matrix
+
+    matrix_dir = args.matrix_dir
+    if not os.path.isdir(matrix_dir):
+        print(f"matrix directory not found: {matrix_dir}")
+        return 2
+
+    verify_dir, verify = verify_matrix(matrix_dir)
+    with open(f"{verify_dir}/verify-report.md") as f:
+        print(f.read())
+    print(f"Verify bundle: {verify_dir}")
+    return 0 if verify.mismatched_cells == 0 else 1
+
+
 def cmd_pulse(args: argparse.Namespace) -> int:
     from .pulse import (
         export_records,
@@ -1077,6 +1115,22 @@ def main(argv: list[str] | None = None) -> int:
                                " layer (e.g., auth=plain.v1)")
     p_matrix.add_argument("--out", default="runs")
     p_matrix.set_defaults(func=cmd_matrix)
+
+    p_matrix_diff = sub.add_parser(
+        "matrix-diff", help="compare two matrix runs: detect regressions"
+                            " and improvements")
+    p_matrix_diff.add_argument("old",
+                               help="path to the old/previous matrix directory")
+    p_matrix_diff.add_argument("new",
+                               help="path to the new/current matrix directory")
+    p_matrix_diff.set_defaults(func=cmd_matrix_diff)
+
+    p_matrix_verify = sub.add_parser(
+        "matrix-verify", help="replay a matrix and verify all cells"
+                              " produce identical verdicts")
+    p_matrix_verify.add_argument("matrix_dir",
+                                 help="path to the matrix directory")
+    p_matrix_verify.set_defaults(func=cmd_matrix_verify)
 
     p_compare = sub.add_parser(
         "compare", help="run the same scenario twice, baseline against"

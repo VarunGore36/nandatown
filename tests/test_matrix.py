@@ -9,20 +9,27 @@ from nandatown.matrix import (
     FAULT_CATALOG,
     CellResult,
     CellStats,
+    DiffEntry,
     FaultSpec,
     MatrixResult,
     PropagationTrace,
+    VerifyResult,
     _build_layer_overrides,
     _build_scenario_fault_rules,
     _compute_cell_stats,
     _resolve_fault,
     _trace_propagation,
     _wilson_ci,
+    diff_matrices,
+    load_matrix_result,
     register_fault,
+    render_diff_report,
     render_heatmap,
     render_matrix_report,
+    render_verify_report,
     run_failure_matrix,
     run_matrix_comparison,
+    verify_matrix,
 )
 from nandatown.sim.scenario import load_bundled
 
@@ -1040,3 +1047,358 @@ class TestEvidenceIntegration:
             if name.startswith("sim-"):
                 bundle = load_bundle(os.path.join(cell_dir, name))
                 assert len(bundle["result"].stages) > 0
+
+
+class TestLoadMatrixResult:
+
+    def test_load_existing_matrix(self, tmp_path):
+        matrix_dir, original = run_failure_matrix(
+            scenarios=["voting"],
+            faults=["transport/drop"],
+            trials=2,
+            seed_base=2000,
+            out_dir=str(tmp_path),
+            include_baseline=False,
+        )
+        loaded = load_matrix_result(matrix_dir)
+        assert loaded.matrix_id == original.matrix_id
+        assert loaded.scenarios == original.scenarios
+        assert loaded.trials_per_cell == original.trials_per_cell
+        assert loaded.seed_base == original.seed_base
+        assert len(loaded.cells) == len(original.cells)
+
+    def test_load_preserves_cell_stats(self, tmp_path):
+        matrix_dir, _ = run_failure_matrix(
+            scenarios=["capability_spoofing"],
+            faults=["auth/none"],
+            trials=3,
+            seed_base=2000,
+            out_dir=str(tmp_path),
+            include_baseline=False,
+        )
+        loaded = load_matrix_result(matrix_dir)
+        cell = loaded.cells["capability_spoofing/auth/none"]
+        assert cell.stats.pass_rate < 1.0
+        assert cell.violations > 0
+
+    def test_load_missing_dir_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            load_matrix_result(str(tmp_path / "nonexistent"))
+
+
+class TestMatrixDiff:
+
+    def test_diff_identical_matrices(self, tmp_path):
+        matrix_dir, _ = run_failure_matrix(
+            scenarios=["voting"],
+            faults=["transport/drop"],
+            trials=2,
+            seed_base=2000,
+            out_dir=str(tmp_path / "runs"),
+            include_baseline=False,
+        )
+        diff_dir, diff = diff_matrices(matrix_dir, matrix_dir)
+        assert diff.regressions == 0
+        assert diff.improvements == 0
+        assert diff.unchanged > 0
+        assert diff.new_cells == 0
+        assert diff.removed_cells == 0
+
+    def test_diff_different_seeds(self, tmp_path):
+        dir1, _ = run_failure_matrix(
+            scenarios=["voting"],
+            faults=["transport/drop"],
+            trials=2,
+            seed_base=2000,
+            out_dir=str(tmp_path / "old"),
+            include_baseline=False,
+        )
+        dir2, _ = run_failure_matrix(
+            scenarios=["voting"],
+            faults=["transport/drop"],
+            trials=2,
+            seed_base=3000,
+            out_dir=str(tmp_path / "new"),
+            include_baseline=False,
+        )
+        diff_dir, diff = diff_matrices(dir1, dir2)
+        assert diff.old_matrix_id != diff.new_matrix_id
+        assert len(diff.entries) > 0
+
+    def test_diff_detects_new_cells(self, tmp_path):
+        dir1, _ = run_failure_matrix(
+            scenarios=["capability_spoofing"],
+            faults=["auth/none"],
+            trials=3,
+            seed_base=2000,
+            out_dir=str(tmp_path / "old"),
+            include_baseline=False,
+        )
+        dir2, _ = run_failure_matrix(
+            scenarios=["capability_spoofing"],
+            faults=["baseline"],
+            trials=3,
+            seed_base=2000,
+            out_dir=str(tmp_path / "new"),
+            include_baseline=False,
+        )
+        diff_dir, diff = diff_matrices(dir1, dir2)
+        assert diff.new_cells > 0 or diff.removed_cells > 0
+
+    def test_diff_report_written(self, tmp_path):
+        matrix_dir, _ = run_failure_matrix(
+            scenarios=["voting"],
+            faults=["transport/drop"],
+            trials=1,
+            seed_base=2000,
+            out_dir=str(tmp_path / "runs"),
+            include_baseline=False,
+        )
+        diff_dir, _ = diff_matrices(matrix_dir, matrix_dir)
+        report_path = os.path.join(diff_dir, "diff-report.md")
+        assert os.path.exists(report_path)
+        with open(report_path) as f:
+            text = f.read()
+        assert "Failure Matrix Diff" in text
+
+    def test_diff_json_written(self, tmp_path):
+        matrix_dir, _ = run_failure_matrix(
+            scenarios=["voting"],
+            faults=["transport/drop"],
+            trials=1,
+            seed_base=2000,
+            out_dir=str(tmp_path / "runs"),
+            include_baseline=False,
+        )
+        diff_dir, _ = diff_matrices(matrix_dir, matrix_dir)
+        json_path = os.path.join(diff_dir, "diff-result.json")
+        assert os.path.exists(json_path)
+        with open(json_path) as f:
+            data = json.load(f)
+        assert "old_matrix_id" in data
+        assert "new_matrix_id" in data
+
+    def test_diff_entry_to_dict(self):
+        entry = DiffEntry(
+            cell_key="voting/transport/drop",
+            old_pass_rate=1.0,
+            new_pass_rate=0.5,
+            old_violations=0,
+            new_violations=5,
+            delta_pass_rate=-0.5,
+            status="REGRESSION",
+        )
+        d = entry.to_dict()
+        assert d["cell_key"] == "voting/transport/drop"
+        assert d["status"] == "REGRESSION"
+        assert d["delta_pass_rate"] == -0.5
+
+    def test_diff_missing_old_dir_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            diff_matrices(str(tmp_path / "nope"), str(tmp_path / "also_nope"))
+
+    def test_diff_preserves_all_entries(self, tmp_path):
+        matrix_dir, _ = run_failure_matrix(
+            scenarios=["voting", "auction"],
+            faults=["transport/drop"],
+            trials=1,
+            seed_base=2000,
+            out_dir=str(tmp_path / "runs"),
+            include_baseline=False,
+        )
+        _, diff = diff_matrices(matrix_dir, matrix_dir)
+        assert len(diff.entries) == 2
+
+    def test_diff_report_shows_unchanged(self, tmp_path):
+        matrix_dir, _ = run_failure_matrix(
+            scenarios=["voting"],
+            faults=["transport/drop"],
+            trials=1,
+            seed_base=2000,
+            out_dir=str(tmp_path / "runs"),
+            include_baseline=False,
+        )
+        diff_dir, _ = diff_matrices(matrix_dir, matrix_dir)
+        with open(os.path.join(diff_dir, "diff-report.md")) as f:
+            text = f.read()
+        assert "No changes detected" in text
+
+
+class TestMatrixVerify:
+
+    def test_verify_reproducible_matrix(self, tmp_path):
+        matrix_dir, _ = run_failure_matrix(
+            scenarios=["voting"],
+            faults=["transport/drop"],
+            trials=2,
+            seed_base=2000,
+            out_dir=str(tmp_path),
+            include_baseline=False,
+        )
+        verify_dir, verify = verify_matrix(matrix_dir)
+        assert verify.verified_cells > 0
+        assert verify.mismatched_cells == 0
+        assert verify.total_cells == verify.verified_cells + verify.skipped_cells
+
+    def test_verify_report_written(self, tmp_path):
+        matrix_dir, _ = run_failure_matrix(
+            scenarios=["voting"],
+            faults=["transport/drop"],
+            trials=1,
+            seed_base=2000,
+            out_dir=str(tmp_path),
+            include_baseline=False,
+        )
+        verify_dir, _ = verify_matrix(matrix_dir)
+        report_path = os.path.join(verify_dir, "verify-report.md")
+        assert os.path.exists(report_path)
+        with open(report_path) as f:
+            text = f.read()
+        assert "Reproduction Verification" in text
+        assert "REPRODUCIBLE" in text
+
+    def test_verify_json_written(self, tmp_path):
+        matrix_dir, _ = run_failure_matrix(
+            scenarios=["voting"],
+            faults=["transport/drop"],
+            trials=1,
+            seed_base=2000,
+            out_dir=str(tmp_path),
+            include_baseline=False,
+        )
+        verify_dir, _ = verify_matrix(matrix_dir)
+        json_path = os.path.join(verify_dir, "verify-result.json")
+        assert os.path.exists(json_path)
+        with open(json_path) as f:
+            data = json.load(f)
+        assert data["reproducible"] is True
+        assert data["mismatched_cells"] == 0
+
+    def test_verify_result_to_dict(self):
+        verify = VerifyResult(
+            matrix_id="test",
+            matrix_dir="/tmp/test",
+            total_cells=5,
+            verified_cells=5,
+            mismatched_cells=0,
+        )
+        d = verify.to_dict()
+        assert d["reproducible"] is True
+        assert d["total_cells"] == 5
+
+    def test_verify_detects_tampered_cell(self, tmp_path):
+        matrix_dir, _ = run_failure_matrix(
+            scenarios=["voting"],
+            faults=["transport/drop"],
+            trials=2,
+            seed_base=2000,
+            out_dir=str(tmp_path),
+            include_baseline=False,
+        )
+        cell_dir = os.path.join(matrix_dir, "voting/transport/drop")
+        bundles = sorted(d for d in os.listdir(cell_dir) if d.startswith("sim-"))
+        assert len(bundles) > 0
+        bundle_result_path = os.path.join(cell_dir, bundles[0], "result.json")
+        with open(bundle_result_path) as f:
+            result_data = json.load(f)
+        result_data["verdict"] = "tampered"
+        with open(bundle_result_path, "w") as f:
+            json.dump(result_data, f)
+
+        verify_dir, verify = verify_matrix(matrix_dir)
+        assert verify.mismatched_cells > 0
+
+    def test_verify_missing_dir_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            verify_matrix(str(tmp_path / "nonexistent"))
+
+    def test_verify_multiple_scenarios(self, tmp_path):
+        matrix_dir, _ = run_failure_matrix(
+            scenarios=["voting", "auction"],
+            faults=["transport/drop"],
+            trials=1,
+            seed_base=2000,
+            out_dir=str(tmp_path),
+            include_baseline=False,
+        )
+        verify_dir, verify = verify_matrix(matrix_dir)
+        assert verify.total_cells == 2
+        assert verify.verified_cells == 2
+
+
+class TestMatrixDiffCLI:
+
+    def test_diff_cli_identical(self, tmp_path, capsys):
+        from nandatown.cli import main
+
+        matrix_dir, _ = run_failure_matrix(
+            scenarios=["voting"],
+            faults=["transport/drop"],
+            trials=1,
+            seed_base=2000,
+            out_dir=str(tmp_path / "runs"),
+            include_baseline=False,
+        )
+        ret = main([
+            "matrix-diff", matrix_dir, matrix_dir,
+        ])
+        assert ret == 0
+        text = capsys.readouterr().out
+        assert "Failure Matrix Diff" in text
+
+    def test_diff_cli_different(self, tmp_path, capsys):
+        from nandatown.cli import main
+
+        dir1, _ = run_failure_matrix(
+            scenarios=["capability_spoofing"],
+            faults=["auth/none"],
+            trials=2,
+            seed_base=2000,
+            out_dir=str(tmp_path / "old"),
+            include_baseline=False,
+        )
+        dir2, _ = run_failure_matrix(
+            scenarios=["capability_spoofing"],
+            faults=["baseline"],
+            trials=2,
+            seed_base=2000,
+            out_dir=str(tmp_path / "new"),
+            include_baseline=False,
+        )
+        ret = main(["matrix-diff", dir1, dir2])
+        assert ret == 0
+        text = capsys.readouterr().out
+        assert "Failure Matrix Diff" in text
+        assert "new" in text or "removed" in text
+
+    def test_diff_cli_missing_dir(self, tmp_path, capsys):
+        from nandatown.cli import main
+
+        ret = main(["matrix-diff", "/no/such/dir", "/also/nope"])
+        assert ret == 2
+
+
+class TestMatrixVerifyCLI:
+
+    def test_verify_cli_reproducible(self, tmp_path, capsys):
+        from nandatown.cli import main
+
+        matrix_dir, _ = run_failure_matrix(
+            scenarios=["voting"],
+            faults=["transport/drop"],
+            trials=1,
+            seed_base=2000,
+            out_dir=str(tmp_path),
+            include_baseline=False,
+        )
+        ret = main(["matrix-verify", matrix_dir])
+        assert ret == 0
+        text = capsys.readouterr().out
+        assert "REPRODUCIBLE" in text
+
+    def test_verify_cli_missing_dir(self, tmp_path, capsys):
+        from nandatown.cli import main
+
+        ret = main(["matrix-verify", "/no/such/dir"])
+        assert ret == 2
+
