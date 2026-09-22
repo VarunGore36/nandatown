@@ -35,11 +35,12 @@ class FaultSpec:
     transport_nth: int = 1
     transport_delay: float | None = None
     transport_rate: float | None = None
+    transport_groups: list[list[str]] | None = None
     swap_plugin_id: str | None = None
     description: str = ""
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "fault_id": self.fault_id,
             "layer": self.layer,
             "fault_type": self.fault_type,
@@ -51,6 +52,9 @@ class FaultSpec:
             "swap_plugin_id": self.swap_plugin_id,
             "description": self.description,
         }
+        if self.transport_groups is not None:
+            result["transport_groups"] = self.transport_groups
+        return result
 
 
 FAULT_CATALOG: dict[str, FaultSpec] = {}
@@ -149,6 +153,16 @@ register_fault(FaultSpec(
 ))
 
 
+register_fault(FaultSpec(
+    fault_id="transport/partition",
+    layer="transport",
+    fault_type="transport_fault",
+    transport_action="partition",
+    transport_groups=[],
+    description="Network partition: agents in different groups cannot communicate",
+))
+
+
 DEFAULT_MATRIX: dict[str, list[str]] = {
     "marketplace": [
         "transport/duplicate",
@@ -180,6 +194,9 @@ DEFAULT_MATRIX: dict[str, list[str]] = {
         "transport/drop",
         "transport/rate_flood",
     ],
+    "network_partition": [
+        "transport/partition",
+    ],
 }
 
 
@@ -197,6 +214,8 @@ def _build_scenario_fault_rules(faults: list[FaultSpec]) -> list[dict[str, Any]]
             rule["delay"] = fault.transport_delay
         if fault.transport_rate is not None:
             rule["rate"] = fault.transport_rate
+        if fault.transport_groups is not None:
+            rule["groups"] = fault.transport_groups
         rules.append(rule)
     return rules
 
@@ -231,7 +250,7 @@ class PropagationTrace:
 
 FAULT_EVENT_KINDS = {
     "message_dropped", "message_duplicated", "message_delayed",
-    "card_unverified", "signature_invalid",
+    "card_unverified", "signature_invalid", "message_partition_blocked",
 }
 
 PROPAGATION_CHAINS: dict[str, list[tuple[str, str]]] = {
@@ -251,6 +270,9 @@ PROPAGATION_CHAINS: dict[str, list[tuple[str, str]]] = {
     ],
     "auth/none": [
         ("card_unverified", "forged card was registered"),
+    ],
+    "transport/partition": [
+        ("message_partition_blocked", "cross-group message blocked by partition"),
     ],
 }
 
